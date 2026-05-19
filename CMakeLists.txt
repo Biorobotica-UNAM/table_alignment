@@ -15,6 +15,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(vision_interfaces REQUIRED)
 
 add_executable(table_segmenter_node src/table_segmenter_node.cpp)
 
@@ -31,6 +32,7 @@ ament_target_dependencies(table_segmenter_node
   geometry_msgs
   tf2_ros
   Eigen3
+  vision_interfaces
 )
 
 if(BUILD_TESTING)
