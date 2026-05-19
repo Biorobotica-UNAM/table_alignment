@@ -1,20 +1,21 @@
+#include <Eigen/Dense>
 #include <cmath>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <mutex>
+#include <pcl/common/centroid.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl_conversions/pcl_conversions.h>
-#include <pcl/common/centroid.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float64.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <vision_interfaces/srv/get_table_alignment.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <tf2_ros/transform_broadcaster.h>
-#include <Eigen/Dense>
 
 class TableSegmenterNode : public rclcpp::Node {
 public:
@@ -26,6 +27,12 @@ public:
         std::bind(&TableSegmenterNode::point_cloud_callback, this,
                   std::placeholders::_1));
 
+    get_alignment_srv_ =
+        this->create_service<vision_interfaces::srv::GetTableAlignment>(
+            "/vision/get_table_alignment",
+            std::bind(&TableSegmenterNode::get_alignment_callback, this,
+                      std::placeholders::_1, std::placeholders::_2));
+
     // Publicador de nube de puntos
     publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "camera/table_points", 10);
@@ -35,41 +42,64 @@ public:
         "camera/table_alignment", 10);
 
     // Publicadores para debug visual
-    marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>(
-        "camera/table_normal_marker", 10);
-    
-    marker_array_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-        "camera/table_axes_markers", 10);
-
-    plane_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>(
-        "camera/table_plane_marker", 10);
-
-    // Publicador del vector de desalineación
-    misalignment_vector_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>(
-        "camera/table_misalignment_vector", 10);
-
-    // Publicador de distancia de desalineación
-    misalignment_distance_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>(
-        "camera/table_misalignment_distance", 10);
-
-    // TF broadcaster para visualizar ejes
-    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+    marker_array_publisher_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "camera/table_axes_markers", 10);
   }
 
 private:
-  const double tolerance_deg = 1.0; // tolerancia
+  const double tolerance_deg = 0.5; // tolerancia
+  double last_angle_ =
+      0.0; // guarda el último ángulo para no saltar entre bordes
 
   void
   point_cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(latest_cloud_mutex_);
+    latest_cloud_msg_ = msg;
+  }
+
+  void get_alignment_callback(
+      const std::shared_ptr<
+          vision_interfaces::srv::GetTableAlignment::Request> /*request*/,
+      std::shared_ptr<vision_interfaces::srv::GetTableAlignment::Response>
+          response) {
+    sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg;
+    {
+      std::lock_guard<std::mutex> lock(latest_cloud_mutex_);
+      cloud_msg = latest_cloud_msg_;
+    }
+
+    if (!cloud_msg) {
+      response->success = false;
+      response->message = "no_pointcloud_available";
+      response->angle = 0.0;
+      RCLCPP_WARN(this->get_logger(),
+                  "[table_segmenter] Solicitud de align sin nube disponible");
+      return;
+    }
+
+    double angle_deg = 0.0;
+    std::string error;
+    const bool ok = process_cloud(*cloud_msg, angle_deg, error);
+
+    response->success = ok;
+    response->angle = ok ? angle_deg : 0.0;
+    response->message = ok ? "ok" : error;
+  }
+
+  bool process_cloud(const sensor_msgs::msg::PointCloud2 &input_msg,
+                     double &angle_deg_out, std::string &error_out) {
     RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] Recibida nube: frame='%s' size_msg=%u width=%u height=%u",
-                 msg->header.frame_id.c_str(), msg->width * msg->height,
-                 msg->width, msg->height);
+                 "[table_segmenter] Recibida nube: frame='%s' size_msg=%u "
+                 "width=%u height=%u",
+                 input_msg.header.frame_id.c_str(),
+                 input_msg.width * input_msg.height, input_msg.width,
+                 input_msg.height);
 
     // msg a PointCloud
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(
         new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::fromROSMsg(*msg, *cloud);
+    pcl::fromROSMsg(input_msg, *cloud);
 
     RCLCPP_DEBUG(this->get_logger(),
                  "[table_segmenter] Nube convertida a PCL: puntos=%zu",
@@ -78,7 +108,8 @@ private:
     if (cloud->empty()) {
       RCLCPP_WARN(this->get_logger(),
                   "[table_segmenter] Nube vacía, se omite procesamiento");
-      return;
+      error_out = "empty_cloud";
+      return false;
     }
 
     // ROI
@@ -96,7 +127,7 @@ private:
     // Eje Y
     pass.setInputCloud(cloud);
     pass.setFilterFieldName("y");
-    pass.setFilterLimits(-0.8, 0.0);
+    pass.setFilterLimits(-0.8, 0.8);
     pass.filter(*cloud);
     RCLCPP_DEBUG(this->get_logger(),
                  "[table_segmenter] Filtro Y aplicado: puntos=%zu",
@@ -105,94 +136,50 @@ private:
     // Eje X
     pass.setInputCloud(cloud);
     pass.setFilterFieldName("x");
-    pass.setFilterLimits(-0.5, 0.5);
+    pass.setFilterLimits(-1.5, 1.5);
     pass.filter(*cloud);
     RCLCPP_DEBUG(this->get_logger(),
                  "[table_segmenter] Filtro X aplicado: puntos=%zu",
                  cloud->size());
 
     if (cloud->size() < 500) {
-      RCLCPP_WARN(this->get_logger(),
-                  "[table_segmenter] Muy pocos puntos tras ROI (%zu), no se segmenta",
-                  cloud->size());
-      return;
+      RCLCPP_WARN(
+          this->get_logger(),
+          "[table_segmenter] Muy pocos puntos tras ROI (%zu), no se segmenta",
+          cloud->size());
+      error_out = "insufficient_points_after_roi";
+      return false;
     }
 
-    // RANSAC
+    // 1. RANSAC para el plano de la mesa
     pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
     pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
     pcl::SACSegmentation<pcl::PointXYZ> seg;
 
     seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
+    seg.setModelType(
+        pcl::SACMODEL_PERPENDICULAR_PLANE); // Forzar plano horizontal
     seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setDistanceThreshold(0.01); // 1 cm
+    seg.setAxis(Eigen::Vector3f(0.0, 1.0, 0.0)); // Eje Y de la cámara
+    seg.setEpsAngle(45.0 * (M_PI / 180.0)); // Tolerancia de 45 grados (permite
+                                            // tilt de cámara, rechaza paredes)
+    seg.setDistanceThreshold(0.02);         // 2 cm
     seg.setMaxIterations(200);
     seg.setInputCloud(cloud);
     seg.segment(*inliers, *coefficients);
 
     RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] RANSAC terminado: inliers=%zu coeffs=%zu",
-                 inliers->indices.size(), coefficients->values.size());
+                 "[table_segmenter] RANSAC plano terminado: inliers=%zu",
+                 inliers->indices.size());
 
     if (inliers->indices.empty()) {
       RCLCPP_WARN(this->get_logger(),
-                  "[table_segmenter] No se encontró un plano");
-      return;
+                  "[table_segmenter] No se encontró la superficie de la mesa");
+      error_out = "plane_not_found";
+      return false;
     }
 
-    // coeficientes del plano: ax + by + cz + d = 0
-    // vector normal (a, b, c).
-    float a = coefficients->values[0];
-    float b = coefficients->values[1];
-    float c = coefficients->values[2];
-    // float d = coefficients->values[3];
-
-    // Calcular el eje Y del plano proyectando el eje Y del mundo sobre el plano
-    float norm_tmp = std::sqrt(a * a + b * b + c * c);
-    float nx_tmp = a / norm_tmp;
-    float ny_tmp = b / norm_tmp;
-    float nz_tmp = c / norm_tmp;
-
-    Eigen::Vector3f normal_world(nx_tmp, ny_tmp, nz_tmp);
-    Eigen::Vector3f ref_y_world(0.0f, 1.0f, 0.0f); // +Y hacia el usuario en el frame de la camara
-    Eigen::Vector3f plane_y = (ref_y_world - normal_world * ref_y_world.dot(normal_world)).normalized();
-
-    // Ángulo (radianes) de desalineación alrededor de Z: 0 cuando plane_y == (0,1,0)
-    double angle_rad = std::atan2(plane_y[0], plane_y[1]);
-    double angle_deg = angle_rad * (180.0 / M_PI);
-
-    // Normalizar a [-90,90]
-    if (angle_deg > 90)
-      angle_deg -= 180;
-    if (angle_deg < -90)
-      angle_deg += 180;
-
-    // tolerancia
-    if (std::abs(angle_deg) < tolerance_deg) {
-      angle_deg = 0.0;
-      angle_rad = 0.0;
-    }
-
-    RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] Plano: a=%.6f b=%.6f angle_rad=%.6f angle_deg=%.3f tol=%.3f %s",
-                 a, b, angle_rad, angle_deg, tolerance_deg,
-                 (angle_deg == 0.0 ? "ALINEADA" : "DESALINEADA"));
-
-    // logs
-    auto angle_msg = std_msgs::msg::Float64();
-    angle_msg.data = angle_deg;
-    angle_publisher_->publish(angle_msg);
-
-    RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] Publicado camera/table_alignment = %.6f rad",
-                 angle_msg.data);
-
-    RCLCPP_INFO(this->get_logger(),
-                "[table_segmenter] Giro necesario: %.2f grados [%s]",
-                angle_deg, (angle_deg == 0.0 ? "ALINEADA" : "DESALINEADA"));
-
-    // publicar puntos
+    // 2. Extraer puntos de la mesa
     pcl::PointCloud<pcl::PointXYZ>::Ptr table_cloud(
         new pcl::PointCloud<pcl::PointXYZ>);
     pcl::ExtractIndices<pcl::PointXYZ> extract;
@@ -201,9 +188,211 @@ private:
     extract.setNegative(false);
     extract.filter(*table_cloud);
 
+    // 3. Encontrar el borde frontal de la mesa
+    // Primero, calcular los límites del campo de visión (FOV) para ignorar los
+    // cortes artificiales
+    float theta_min = std::numeric_limits<float>::max();
+    float theta_max = -std::numeric_limits<float>::max();
+    float phi_max =
+        -std::numeric_limits<float>::max(); // phi máximo es el borde inferior
+                                            // de la imagen
+
+    for (const auto &pt : table_cloud->points) {
+      float theta = std::atan2(pt.x, pt.z);
+      float phi = std::atan2(pt.y, pt.z);
+      if (theta < theta_min)
+        theta_min = theta;
+      if (theta > theta_max)
+        theta_max = theta;
+      if (phi > phi_max)
+        phi_max = phi;
+    }
+
+    // Dividir en bins a lo largo del eje X para encontrar el frente a lo ancho
+    // de la mesa
+    float min_x = std::numeric_limits<float>::max();
+    float max_x = -std::numeric_limits<float>::max();
+    for (const auto &pt : table_cloud->points) {
+      if (pt.x < min_x)
+        min_x = pt.x;
+      if (pt.x > max_x)
+        max_x = pt.x;
+    }
+
+    int num_bins = 100; // Mayor resolución para los bins
+    float bin_width = (max_x - min_x) / num_bins;
+    std::vector<float> bin_min_z(num_bins, std::numeric_limits<float>::max());
+    std::vector<pcl::PointXYZ> bin_min_pt(num_bins);
+
+    for (const auto &pt : table_cloud->points) {
+      if (bin_width <= 0)
+        break;
+      int bin = (pt.x - min_x) / bin_width;
+      if (bin < 0)
+        bin = 0;
+      if (bin >= num_bins)
+        bin = num_bins - 1;
+
+      if (pt.z < bin_min_z[bin]) {
+        bin_min_z[bin] = pt.z;
+        bin_min_pt[bin] = pt;
+      }
+    }
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr edge_cloud(
+        new pcl::PointCloud<pcl::PointXYZ>);
+    for (int i = 0; i < num_bins; ++i) {
+      if (bin_min_z[i] < std::numeric_limits<float>::max()) {
+        pcl::PointXYZ pt = bin_min_pt[i];
+        float theta = std::atan2(pt.x, pt.z);
+        float phi = std::atan2(pt.y, pt.z);
+
+        // Rechazar puntos que pertenezcan a cortes artificiales del FOV o del
+        // filtro Z
+        bool is_artificial = (theta < theta_min + 0.05f) ||
+                             (theta > theta_max - 0.05f) ||
+                             (phi > phi_max - 0.05f) || (pt.z > 1.45f);
+
+        if (!is_artificial) {
+          edge_cloud->points.push_back(pt);
+        }
+      }
+    }
+
+    if (edge_cloud->size() < 10) {
+      RCLCPP_WARN(this->get_logger(), "[table_segmenter] No se encontraron "
+                                      "suficientes puntos en el borde frontal");
+      error_out = "edge_not_found";
+      return false;
+    }
+
+    // 4. RANSAC para encontrar la línea 3D sobre el borde frontal
+    pcl::ModelCoefficients::Ptr line_coefficients1(new pcl::ModelCoefficients);
+    pcl::PointIndices::Ptr line_inliers1(new pcl::PointIndices);
+    pcl::SACSegmentation<pcl::PointXYZ> line_seg;
+
+    line_seg.setOptimizeCoefficients(true);
+    line_seg.setModelType(pcl::SACMODEL_LINE);
+    line_seg.setMethodType(pcl::SAC_RANSAC);
+    line_seg.setDistanceThreshold(0.02); // 2 cm
+    line_seg.setMaxIterations(200);
+    line_seg.setInputCloud(edge_cloud);
+    line_seg.segment(*line_inliers1, *line_coefficients1);
+
+    if (line_inliers1->indices.empty()) {
+      RCLCPP_WARN(
+          this->get_logger(),
+          "[table_segmenter] No se pudo ajustar una línea al borde frontal");
+      error_out = "line_not_found";
+      return false;
+    }
+
+    // Calcular el ángulo del primer borde detectado
+    float lx1 = line_coefficients1->values[3];
+    float ly1 = line_coefficients1->values[4];
+    float lz1 = line_coefficients1->values[5];
+    if (lx1 < 0) {
+      lx1 = -lx1;
+      ly1 = -ly1;
+      lz1 = -lz1;
+    }
+    double angle1 = std::atan2(lz1, lx1) * (180.0 / M_PI);
+
+    // Intentar buscar una SEGUNDA línea (por si hay mesas en forma de L)
+    pcl::PointCloud<pcl::PointXYZ>::Ptr edge_cloud_remaining(
+        new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::ExtractIndices<pcl::PointXYZ> extract_edge;
+    extract_edge.setInputCloud(edge_cloud);
+    extract_edge.setIndices(line_inliers1);
+    extract_edge.setNegative(true);
+    extract_edge.filter(*edge_cloud_remaining);
+
+    double chosen_angle = angle1;
+    pcl::ModelCoefficients::Ptr final_line_coefficients = line_coefficients1;
+    pcl::PointIndices::Ptr final_line_inliers = line_inliers1;
+
+    if (edge_cloud_remaining->size() >= 10) {
+      pcl::ModelCoefficients::Ptr line_coefficients2(
+          new pcl::ModelCoefficients);
+      pcl::PointIndices::Ptr line_inliers2(new pcl::PointIndices);
+      line_seg.setInputCloud(edge_cloud_remaining);
+      line_seg.segment(*line_inliers2, *line_coefficients2);
+
+      if (!line_inliers2->indices.empty() &&
+          line_inliers2->indices.size() > 5) {
+        float lx2 = line_coefficients2->values[3];
+        float ly2 = line_coefficients2->values[4];
+        float lz2 = line_coefficients2->values[5];
+        if (lx2 < 0) {
+          lx2 = -lx2;
+          ly2 = -ly2;
+          lz2 = -lz2;
+        }
+        double angle2 = std::atan2(lz2, lx2) * (180.0 / M_PI);
+
+        // Elegir la línea cuyo ángulo se parezca más al último ángulo conocido
+        // Esto evita saltos bruscos cuando hay dos bordes formando una esquina
+        // (mesa en L)
+        if (std::abs(angle2 - last_angle_) < std::abs(angle1 - last_angle_)) {
+          chosen_angle = angle2;
+          final_line_coefficients = line_coefficients2;
+          final_line_inliers = line_inliers2;
+        }
+      }
+    }
+
+    // Actualizar nuestro last_angle_
+    last_angle_ = chosen_angle;
+
+    // Usar la línea final elegida
+    float lx = final_line_coefficients->values[3];
+    float ly = final_line_coefficients->values[4];
+    float lz = final_line_coefficients->values[5];
+    if (lx < 0) {
+      lx = -lx;
+      ly = -ly;
+      lz = -lz;
+    }
+
+    // Calcular ángulo de la línea respecto al eje X (visto desde arriba en el
+    // plano X-Z) Cuando la mesa está perfectamente de frente, el borde es
+    // horizontal (Lz = 0, Lx > 0) -> angle = 0
+    double angle_rad = std::atan2(lz, lx);
+    double angle_deg = angle_rad * (180.0 / M_PI);
+
+    // Normalizar si es necesario (ya debería estar entre -180 y 180 por atan2)
+    // Aplicar tolerancia de desalineación
+    if (std::abs(angle_deg) < tolerance_deg) {
+      angle_deg = 0.0;
+      angle_rad = 0.0;
+    }
+
+    angle_deg_out = angle_deg;
+
+    RCLCPP_DEBUG(this->get_logger(),
+                 "[table_segmenter] Borde: vector=(%.3f, %.3f, %.3f) "
+                 "angle_rad=%.6f angle_deg=%.3f tol=%.3f %s",
+                 lx, ly, lz, angle_rad, angle_deg, tolerance_deg,
+                 (angle_deg == 0.0 ? "ALINEADA" : "DESALINEADA"));
+
+    // Publicar ángulo
+    auto angle_msg = std_msgs::msg::Float64();
+    angle_msg.data = angle_deg;
+    angle_publisher_->publish(angle_msg);
+
+    RCLCPP_DEBUG(
+        this->get_logger(),
+        "[table_segmenter] Publicado camera/table_alignment = %.6f grados",
+        angle_msg.data);
+
+    RCLCPP_INFO(this->get_logger(),
+                "[table_segmenter] Giro necesario: %.2f grados [%s]", angle_deg,
+                (angle_deg == 0.0 ? "ALINEADA" : "DESALINEADA"));
+
+    // Publicar nube de puntos de la mesa
     sensor_msgs::msg::PointCloud2 output_msg;
     pcl::toROSMsg(*table_cloud, output_msg);
-    output_msg.header = msg->header;
+    output_msg.header = input_msg.header;
     publisher_->publish(output_msg);
 
     RCLCPP_DEBUG(this->get_logger(),
@@ -211,100 +400,48 @@ private:
                  table_cloud->size());
 
     // ============ DEBUG VISUAL ============
-    // Calcular centroide del plano
     Eigen::Vector4f centroid;
-    pcl::compute3DCentroid(*table_cloud, centroid);
+    centroid[0] = final_line_coefficients->values[0];
+    centroid[1] = final_line_coefficients->values[1];
+    centroid[2] = final_line_coefficients->values[2];
+    centroid[3] = 1.0f;
 
-    // Vector normal normalizado
-    float norm = std::sqrt(a * a + b * b + c * c);
-    float nx = a / norm;
-    float ny = b / norm;
-    float nz = c / norm;
+    Eigen::Vector3f normal(coefficients->values[0], coefficients->values[1],
+                           coefficients->values[2]);
+    Eigen::Vector3f edge_dir(lx, ly, lz);
 
-    RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] Normal: nx=%.3f ny=%.3f nz=%.3f | Centroide: x=%.3f y=%.3f z=%.3f",
-                 nx, ny, nz, centroid[0], centroid[1], centroid[2]);
+    // Publicar los ejes del borde frontal
+    publish_axes_markers(input_msg.header, centroid, normal, edge_dir);
 
-    // 1. Publicar la normal como una flecha (Marker)
-    publish_normal_marker(msg->header, centroid, nx, ny, nz);
-
-    // 2. Publicar los ejes del plano como Markers (3 flechas: X, Y, Z)
-    publish_axes_markers(msg->header, centroid, nx, ny, nz);
-
-    // 3. Publicar TF del plano (para visualizar frame)
-    publish_plane_tf(msg->header, centroid, nx, ny, nz);
-
-    // 4. Publicar el plano como un polígono visualizado
-    publish_plane_polygon_marker(msg->header, table_cloud);
-
-    // 5. Publicar vector de desalineación
-    publish_misalignment_vector(msg->header, centroid, angle_rad, nx, ny, nz);
-
-    // 6. Publicar distancia de desalineación
-    publish_misalignment_distance(msg->header, centroid, angle_deg);
+    error_out = "";
+    return true;
   }
 
-  void publish_normal_marker(const std_msgs::msg::Header& header, 
-                            const Eigen::Vector4f& centroid,
-                            float nx, float ny, float nz) {
-    auto marker = visualization_msgs::msg::Marker();
-    marker.header = header;
-    marker.ns = "table_normal";
-    marker.id = 0;
-    marker.type = visualization_msgs::msg::Marker::ARROW;
-    marker.action = visualization_msgs::msg::Marker::ADD;
+  void publish_axes_markers(const std_msgs::msg::Header &header,
+                            const Eigen::Vector4f &centroid,
+                            const Eigen::Vector3f &normal,
+                            const Eigen::Vector3f &edge_dir) {
+    // Eje X (Verde): Dirección del borde de la mesa
+    Eigen::Vector3f axis_x = edge_dir.normalized();
 
-    // Punto inicial (centroide)
-    marker.points.resize(2);
-    marker.points[0].x = centroid[0];
-    marker.points[0].y = centroid[1];
-    marker.points[0].z = centroid[2];
+    // Eje Z (Rojo): Normal de la superficie de la mesa
+    Eigen::Vector3f axis_z = normal.normalized();
 
-    // Punto final (centroide + normal * 0.1)
-    marker.points[1].x = centroid[0] + nx * 0.1;
-    marker.points[1].y = centroid[1] + ny * 0.1;
-    marker.points[1].z = centroid[2] + nz * 0.1;
+    // Eje Y (Azul): Ortogonal (hacia el interior de la mesa o hacia afuera)
+    Eigen::Vector3f axis_y = axis_z.cross(axis_x).normalized();
 
-    marker.scale.x = 0.01;  // shaft diameter
-    marker.scale.y = 0.02;  // head diameter
-    marker.scale.z = 0.03;  // head length
-
-    marker.color.r = 1.0f;  // Rojo para la normal
-    marker.color.g = 0.0f;
-    marker.color.b = 0.0f;
-    marker.color.a = 0.8f;
-
-    marker.lifetime = rclcpp::Duration(0, 500000000);  // 0.5 segundos
-
-    marker_publisher_->publish(marker);
-  }
-
-  void publish_axes_markers(const std_msgs::msg::Header& header,
-                           const Eigen::Vector4f& centroid,
-                           float nx, float ny, float nz) {
-    // Crear dos vectores ortogonales al normal para formar los ejes
-    Eigen::Vector3f normal(nx, ny, nz);
-    
-    // Encontrar un vector ortogonal
-    Eigen::Vector3f axis1;
-    if (std::abs(nx) < 0.9f) {
-      axis1 = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
-    } else {
-      axis1 = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
-    }
-
-    // Producto cruzado para obtener eje ortogonal
-    Eigen::Vector3f axis2 = normal.cross(axis1).normalized();
-    axis1 = axis2.cross(normal).normalized();
+    // Asegurar ortogonalidad perfecta ajustando el Z
+    axis_z = axis_x.cross(axis_y).normalized();
 
     auto marker_array = visualization_msgs::msg::MarkerArray();
 
-    // Eje 1 (Verde - X del plano)
-    {
+    // Función lambda para no repetir código de markers
+    auto add_arrow_marker = [&](int id, const Eigen::Vector3f &dir, float r,
+                                float g, float b) {
       auto marker = visualization_msgs::msg::Marker();
       marker.header = header;
       marker.ns = "table_axes";
-      marker.id = 1;
+      marker.id = id;
       marker.type = visualization_msgs::msg::Marker::ARROW;
       marker.action = visualization_msgs::msg::Marker::ADD;
 
@@ -313,254 +450,42 @@ private:
       marker.points[0].y = centroid[1];
       marker.points[0].z = centroid[2];
 
-      marker.points[1].x = centroid[0] + axis1[0] * 0.15;
-      marker.points[1].y = centroid[1] + axis1[1] * 0.15;
-      marker.points[1].z = centroid[2] + axis1[2] * 0.15;
+      marker.points[1].x = centroid[0] + dir[0] * 0.15;
+      marker.points[1].y = centroid[1] + dir[1] * 0.15;
+      marker.points[1].z = centroid[2] + dir[2] * 0.15;
 
-      marker.scale.x = 0.008;
-      marker.scale.y = 0.015;
-      marker.scale.z = 0.025;
+      marker.scale.x = 0.008; // shaft
+      marker.scale.y = 0.015; // head width
+      marker.scale.z = 0.025; // head length
 
-      marker.color.r = 0.0f;
-      marker.color.g = 1.0f;
-      marker.color.b = 0.0f;
+      marker.color.r = r;
+      marker.color.g = g;
+      marker.color.b = b;
       marker.color.a = 0.8f;
-
-      marker.lifetime = rclcpp::Duration(0, 500000000);
+      marker.lifetime = rclcpp::Duration(0, 500000000); // 0.5 sec
 
       marker_array.markers.push_back(marker);
-    }
+    };
 
-    // Eje 2 (Azul - Y del plano)
-    {
-      auto marker = visualization_msgs::msg::Marker();
-      marker.header = header;
-      marker.ns = "table_axes";
-      marker.id = 2;
-      marker.type = visualization_msgs::msg::Marker::ARROW;
-      marker.action = visualization_msgs::msg::Marker::ADD;
-
-      marker.points.resize(2);
-      marker.points[0].x = centroid[0];
-      marker.points[0].y = centroid[1];
-      marker.points[0].z = centroid[2];
-
-      marker.points[1].x = centroid[0] + axis2[0] * 0.15;
-      marker.points[1].y = centroid[1] + axis2[1] * 0.15;
-      marker.points[1].z = centroid[2] + axis2[2] * 0.15;
-
-      marker.scale.x = 0.008;
-      marker.scale.y = 0.015;
-      marker.scale.z = 0.025;
-
-      marker.color.r = 0.0f;
-      marker.color.g = 0.0f;
-      marker.color.b = 1.0f;
-      marker.color.a = 0.8f;
-
-      marker.lifetime = rclcpp::Duration(0, 500000000);
-
-      marker_array.markers.push_back(marker);
-    }
-
-    // Eje 3 (Rojo - Normal Z)
-    {
-      auto marker = visualization_msgs::msg::Marker();
-      marker.header = header;
-      marker.ns = "table_axes";
-      marker.id = 3;
-      marker.type = visualization_msgs::msg::Marker::ARROW;
-      marker.action = visualization_msgs::msg::Marker::ADD;
-
-      marker.points.resize(2);
-      marker.points[0].x = centroid[0];
-      marker.points[0].y = centroid[1];
-      marker.points[0].z = centroid[2];
-
-      marker.points[1].x = centroid[0] + nx * 0.15;
-      marker.points[1].y = centroid[1] + ny * 0.15;
-      marker.points[1].z = centroid[2] + nz * 0.15;
-
-      marker.scale.x = 0.008;
-      marker.scale.y = 0.015;
-      marker.scale.z = 0.025;
-
-      marker.color.r = 1.0f;
-      marker.color.g = 0.0f;
-      marker.color.b = 0.0f;
-      marker.color.a = 0.8f;
-
-      marker.lifetime = rclcpp::Duration(0, 500000000);
-
-      marker_array.markers.push_back(marker);
-    }
+    // Eje X (Borde, Verde)
+    add_arrow_marker(1, axis_x, 0.0f, 1.0f, 0.0f);
+    // Eje Y (Adentro, Azul)
+    add_arrow_marker(2, axis_y, 0.0f, 0.0f, 1.0f);
+    // Eje Z (Arriba/Normal, Rojo)
+    add_arrow_marker(3, axis_z, 1.0f, 0.0f, 0.0f);
 
     marker_array_publisher_->publish(marker_array);
   }
 
-  void publish_plane_tf(const std_msgs::msg::Header& header,
-                       const Eigen::Vector4f& centroid,
-                       float nx, float ny, float nz) {
-    // Crear vectores ortogonales
-    Eigen::Vector3f normal(nx, ny, nz);
-    Eigen::Vector3f axis1;
-
-    if (std::abs(nx) < 0.9f) {
-      axis1 = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
-    } else {
-      axis1 = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
-    }
-
-    Eigen::Vector3f axis2 = normal.cross(axis1).normalized();
-    axis1 = axis2.cross(normal).normalized();
-
-    // Crear quaternion para representar la rotación
-    Eigen::Matrix3f rotation;
-    rotation.col(0) = axis1;
-    rotation.col(1) = axis2;
-    rotation.col(2) = normal;
-
-    Eigen::Quaternionf quat(rotation);
-
-    geometry_msgs::msg::TransformStamped tf;
-    tf.header = header;
-    tf.child_frame_id = "table_plane_frame";
-
-    tf.transform.translation.x = centroid[0];
-    tf.transform.translation.y = centroid[1];
-    tf.transform.translation.z = centroid[2];
-
-    tf.transform.rotation.x = quat.x();
-    tf.transform.rotation.y = quat.y();
-    tf.transform.rotation.z = quat.z();
-    tf.transform.rotation.w = quat.w();
-
-    tf_broadcaster_->sendTransform(tf);
-  }
-
-  void publish_plane_polygon_marker(const std_msgs::msg::Header& header,
-                                    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
-    auto marker = visualization_msgs::msg::Marker();
-    marker.header = header;
-    marker.ns = "table_plane";
-    marker.id = 0;
-    marker.type = visualization_msgs::msg::Marker::TRIANGLE_LIST;
-    marker.action = visualization_msgs::msg::Marker::ADD;
-
-    // Agregar todos los puntos dela nube como mesh
-    for (const auto& pt : cloud->points) {
-      geometry_msgs::msg::Point p;
-      p.x = pt.x;
-      p.y = pt.y;
-      p.z = pt.z;
-      marker.points.push_back(p);
-    }
-
-    marker.scale.x = 1.0;
-    marker.scale.y = 1.0;
-    marker.scale.z = 1.0;
-
-    marker.color.r = 0.5f;
-    marker.color.g = 0.5f;
-    marker.color.b = 1.0f;
-    marker.color.a = 0.3f;
-
-    marker.lifetime = rclcpp::Duration(0, 500000000);
-
-    plane_marker_publisher_->publish(marker);
-  }
-
-  void publish_misalignment_vector(const std_msgs::msg::Header& header,
-                                   const Eigen::Vector4f& centroid,
-                                   float angle_rad,
-                                   float nx, float ny, float nz) {
-    // Crear vector que representa la dirección de rotación necesaria
-    // El vector perpendicular al normal en el plano
-    Eigen::Vector3f normal(nx, ny, nz);
-    
-    // Vector perpendicular al normal (en el plano XY del mundo, aproximadamente)
-    Eigen::Vector3f perp;
-    if (std::abs(nz) < 0.9f) {
-      perp = Eigen::Vector3f(0.0f, 0.0f, 1.0f);
-    } else {
-      perp = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
-    }
-    
-    perp = (perp - normal * normal.dot(perp)).normalized();
-
-    auto marker = visualization_msgs::msg::Marker();
-    marker.header = header;
-    marker.ns = "table_misalignment";
-    marker.id = 0;
-    marker.type = visualization_msgs::msg::Marker::ARROW;
-    marker.action = visualization_msgs::msg::Marker::ADD;
-
-    // Punto inicial
-    marker.points.resize(2);
-    marker.points[0].x = centroid[0];
-    marker.points[0].y = centroid[1];
-    marker.points[0].z = centroid[2];
-
-    // Punto final - escalar según magnitud del ángulo
-    float scale = std::abs(angle_rad) * 0.3f; // 0.3 metros por radian
-    marker.points[1].x = centroid[0] + perp[0] * scale;
-    marker.points[1].y = centroid[1] + perp[1] * scale;
-    marker.points[1].z = centroid[2] + perp[2] * scale;
-
-    marker.scale.x = 0.01;  // shaft diameter
-    marker.scale.y = 0.025; // head diameter
-    marker.scale.z = 0.035; // head length
-
-    marker.color.r = 1.0f;  // Amarillo para desalineación
-    marker.color.g = 1.0f;
-    marker.color.b = 0.0f;
-    marker.color.a = 0.9f;
-
-    marker.lifetime = rclcpp::Duration(0, 500000000);
-
-    misalignment_vector_publisher_->publish(marker);
-  }
-
-  void publish_misalignment_distance(const std_msgs::msg::Header& header,
-                                     const Eigen::Vector4f& centroid,
-                                     float angle_deg) {
-    auto marker = visualization_msgs::msg::Marker();
-    marker.header = header;
-    marker.ns = "table_distance";
-    marker.id = 0;
-    marker.type  = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-    marker.action = visualization_msgs::msg::Marker::ADD;
-
-    marker.pose.position.x = centroid[0];
-    marker.pose.position.y = centroid[1];
-    marker.pose.position.z = centroid[2] + 0.15; // Mostrar encima del centroide
-
-    marker.scale.z = 0.05; // Tamaño del texto
-
-    marker.color.r = 1.0f;
-    marker.color.g = 1.0f;
-    marker.color.b = 1.0f;
-    marker.color.a = 1.0f;
-
-    // Formatear texto con la distancia de desalineación
-    char buffer[100];
-    snprintf(buffer, sizeof(buffer), "Misalignment: %.2f°", angle_deg);
-    marker.text = buffer;
-
-    marker.lifetime = rclcpp::Duration(0, 500000000);
-
-    misalignment_distance_publisher_->publish(marker);
-  }
-
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
+  rclcpp::Service<vision_interfaces::srv::GetTableAlignment>::SharedPtr
+      get_alignment_srv_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr angle_publisher_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_publisher_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_array_publisher_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr plane_marker_publisher_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr misalignment_vector_publisher_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr misalignment_distance_publisher_;
-  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      marker_array_publisher_;
+  sensor_msgs::msg::PointCloud2::SharedPtr latest_cloud_msg_;
+  std::mutex latest_cloud_mutex_;
 };
 
 int main(int argc, char **argv) {
