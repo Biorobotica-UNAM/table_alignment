@@ -23,11 +23,9 @@ find_package(Eigen3 REQUIRED)
 find_package(vision_interfaces REQUIRED)
 
 add_executable(table_segmenter_node src/table_segmenter_node.cpp)
-add_executable(table_drop_tf_node src/table_drop_tf_node.cpp)
 
 install(TARGETS 
   table_segmenter_node
-  table_drop_tf_node
   DESTINATION lib/${PROJECT_NAME})
 
 ament_target_dependencies(table_segmenter_node
@@ -41,17 +39,6 @@ ament_target_dependencies(table_segmenter_node
   tf2_ros
   Eigen3
   vision_interfaces
-)
-
-ament_target_dependencies(table_drop_tf_node
-  rclcpp
-  sensor_msgs
-  std_srvs
-  pcl_conversions
-  visualization_msgs
-  geometry_msgs
-  tf2_ros
-  Eigen3
 )
 
 if(BUILD_TESTING)
