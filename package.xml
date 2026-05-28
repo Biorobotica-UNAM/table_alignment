@@ -15,7 +15,6 @@
   <depend>visualization_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
-  <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
   <depend>vision_interfaces</depend>
 
