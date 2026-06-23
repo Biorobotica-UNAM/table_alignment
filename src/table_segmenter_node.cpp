@@ -60,7 +60,7 @@ private:
 
   void get_alignment_callback(
       const std::shared_ptr<
-          vision_interfaces::srv::GetTableAlignment::Request> /*request*/,
+          vision_interfaces::srv::GetTableAlignment::Request> request,
       std::shared_ptr<vision_interfaces::srv::GetTableAlignment::Response>
           response) {
     sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg;
@@ -80,7 +80,7 @@ private:
 
     double angle_deg = 0.0;
     std::string error;
-    const bool ok = process_cloud(*cloud_msg, angle_deg, error);
+    const bool ok = process_cloud(*cloud_msg, request->is_round, angle_deg, error);
 
     response->success = ok;
     response->angle = ok ? angle_deg : 0.0;
@@ -88,6 +88,7 @@ private:
   }
 
   bool process_cloud(const sensor_msgs::msg::PointCloud2 &input_msg,
+                     bool is_round,
                      double &angle_deg_out, std::string &error_out) {
     RCLCPP_DEBUG(this->get_logger(),
                  "[table_segmenter] Recibida nube: frame='%s' size_msg=%u "
@@ -187,6 +188,50 @@ private:
     extract.setIndices(inliers);
     extract.setNegative(false);
     extract.filter(*table_cloud);
+
+    if (is_round) {
+      if (table_cloud->empty()) {
+        RCLCPP_WARN(this->get_logger(), "[table_segmenter] Nube de la mesa vacia");
+        error_out = "empty_table_cloud";
+        return false;
+      }
+
+      Eigen::Vector4f centroid;
+      pcl::compute3DCentroid(*table_cloud, centroid);
+
+      // En el frame óptico de la cámara: X es la desviación horizontal y Z es el eje adelante (profundidad).
+      double angle_rad = std::atan2(centroid[0], centroid[2]);
+      double angle_deg = angle_rad * (180.0 / M_PI);
+
+      if (std::abs(angle_deg) < tolerance_deg) {
+        angle_deg = 0.0;
+      }
+
+      angle_deg_out = angle_deg;
+
+      RCLCPP_INFO(this->get_logger(),
+                  "[table_segmenter] [Mesa Redonda] Centroide=(%.3f, %.3f, %.3f), Giro necesario: %.2f grados",
+                  centroid[0], centroid[1], centroid[2], angle_deg);
+
+      // Publicar el ángulo
+      auto angle_msg = std_msgs::msg::Float64();
+      angle_msg.data = angle_deg;
+      angle_publisher_->publish(angle_msg);
+
+      // Publicar nube de puntos de la mesa
+      sensor_msgs::msg::PointCloud2 output_msg;
+      pcl::toROSMsg(*table_cloud, output_msg);
+      output_msg.header = input_msg.header;
+      publisher_->publish(output_msg);
+
+      // Publicar marcadores visuales para RViz
+      Eigen::Vector3f normal(0.0, -1.0, 0.0); // Aproximacion de la normal del plano (hacia arriba)
+      Eigen::Vector3f edge_dir(1.0, 0.0, 0.0); // Eje horizontal ficticio
+      publish_axes_markers(input_msg.header, centroid, normal, edge_dir);
+
+      error_out = "";
+      return true;
+    }
 
     // 3. Encontrar el borde frontal de la mesa
     // Primero, calcular los límites del campo de visión (FOV) para ignorar los
