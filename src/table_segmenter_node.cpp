@@ -116,31 +116,31 @@ private:
     // ROI
     pcl::PassThrough<pcl::PointXYZ> pass;
 
-    // Eje Z
+    // Eje X (frente/profundidad)
     pass.setInputCloud(cloud);
-    pass.setFilterFieldName("z");
+    pass.setFilterFieldName("x");
     pass.setFilterLimits(0.0, 1.5);
     pass.filter(*cloud);
     RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] Filtro Z aplicado: puntos=%zu",
+                 "[table_segmenter] Filtro X (frente) aplicado: puntos=%zu",
                  cloud->size());
 
-    // Eje Y
+    // Eje Y (horizontal izquierda-derecha)
     pass.setInputCloud(cloud);
     pass.setFilterFieldName("y");
-    pass.setFilterLimits(-0.8, 0.8);
-    pass.filter(*cloud);
-    RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] Filtro Y aplicado: puntos=%zu",
-                 cloud->size());
-
-    // Eje X
-    pass.setInputCloud(cloud);
-    pass.setFilterFieldName("x");
     pass.setFilterLimits(-1.5, 1.5);
     pass.filter(*cloud);
     RCLCPP_DEBUG(this->get_logger(),
-                 "[table_segmenter] Filtro X aplicado: puntos=%zu",
+                 "[table_segmenter] Filtro Y (horizontal) aplicado: puntos=%zu",
+                 cloud->size());
+
+    // Eje Z (arriba/abajo)
+    pass.setInputCloud(cloud);
+    pass.setFilterFieldName("z");
+    pass.setFilterLimits(-0.8, 0.8);
+    pass.filter(*cloud);
+    RCLCPP_DEBUG(this->get_logger(),
+                 "[table_segmenter] Filtro Z (arriba/abajo) aplicado: puntos=%zu",
                  cloud->size());
 
     if (cloud->size() < 500) {
@@ -161,7 +161,7 @@ private:
     seg.setModelType(
         pcl::SACMODEL_PERPENDICULAR_PLANE); // Forzar plano horizontal
     seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setAxis(Eigen::Vector3f(0.0, 1.0, 0.0)); // Eje Y de la cámara
+    seg.setAxis(Eigen::Vector3f(0.0, 0.0, 1.0)); // Eje Z (arriba/abajo) de la cámara
     seg.setEpsAngle(45.0 * (M_PI / 180.0)); // Tolerancia de 45 grados (permite
                                             // tilt de cámara, rechaza paredes)
     seg.setDistanceThreshold(0.02);         // 2 cm
@@ -199,8 +199,8 @@ private:
       Eigen::Vector4f centroid;
       pcl::compute3DCentroid(*table_cloud, centroid);
 
-      // En el frame óptico de la cámara: X es la desviación horizontal y Z es el eje adelante (profundidad).
-      double angle_rad = std::atan2(centroid[0], centroid[2]);
+      // En el frame óptico de la cámara: X es frente, Y es horizontal, Z es arriba/abajo
+      double angle_rad = std::atan2(centroid[1], centroid[0]);
       double angle_deg = angle_rad * (180.0 / M_PI);
 
       if (std::abs(angle_deg) < tolerance_deg) {
@@ -225,8 +225,8 @@ private:
       publisher_->publish(output_msg);
 
       // Publicar marcadores visuales para RViz
-      Eigen::Vector3f normal(0.0, -1.0, 0.0); // Aproximacion de la normal del plano (hacia arriba)
-      Eigen::Vector3f edge_dir(1.0, 0.0, 0.0); // Eje horizontal ficticio
+      Eigen::Vector3f normal(0.0, 0.0, 1.0); // Aproximacion de la normal del plano (hacia arriba)
+      Eigen::Vector3f edge_dir(0.0, 1.0, 0.0); // Eje horizontal ficticio
       publish_axes_markers(input_msg.header, centroid, normal, edge_dir);
 
       error_out = "";
@@ -243,8 +243,8 @@ private:
                                             // de la imagen
 
     for (const auto &pt : table_cloud->points) {
-      float theta = std::atan2(pt.x, pt.z);
-      float phi = std::atan2(pt.y, pt.z);
+      float theta = std::atan2(pt.y, pt.x);
+      float phi = std::atan2(pt.z, pt.x);
       if (theta < theta_min)
         theta_min = theta;
       if (theta > theta_max)
@@ -253,33 +253,33 @@ private:
         phi_max = phi;
     }
 
-    // Dividir en bins a lo largo del eje X para encontrar el frente a lo ancho
+    // Dividir en bins a lo largo del eje Y para encontrar el frente a lo ancho
     // de la mesa
-    float min_x = std::numeric_limits<float>::max();
-    float max_x = -std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float max_y = -std::numeric_limits<float>::max();
     for (const auto &pt : table_cloud->points) {
-      if (pt.x < min_x)
-        min_x = pt.x;
-      if (pt.x > max_x)
-        max_x = pt.x;
+      if (pt.y < min_y)
+        min_y = pt.y;
+      if (pt.y > max_y)
+        max_y = pt.y;
     }
 
     int num_bins = 100; // Mayor resolución para los bins
-    float bin_width = (max_x - min_x) / num_bins;
-    std::vector<float> bin_min_z(num_bins, std::numeric_limits<float>::max());
+    float bin_width = (max_y - min_y) / num_bins;
+    std::vector<float> bin_min_x(num_bins, std::numeric_limits<float>::max());
     std::vector<pcl::PointXYZ> bin_min_pt(num_bins);
 
     for (const auto &pt : table_cloud->points) {
       if (bin_width <= 0)
         break;
-      int bin = (pt.x - min_x) / bin_width;
+      int bin = (pt.y - min_y) / bin_width;
       if (bin < 0)
         bin = 0;
       if (bin >= num_bins)
         bin = num_bins - 1;
 
-      if (pt.z < bin_min_z[bin]) {
-        bin_min_z[bin] = pt.z;
+      if (pt.x < bin_min_x[bin]) {
+        bin_min_x[bin] = pt.x;
         bin_min_pt[bin] = pt;
       }
     }
@@ -287,16 +287,16 @@ private:
     pcl::PointCloud<pcl::PointXYZ>::Ptr edge_cloud(
         new pcl::PointCloud<pcl::PointXYZ>);
     for (int i = 0; i < num_bins; ++i) {
-      if (bin_min_z[i] < std::numeric_limits<float>::max()) {
+      if (bin_min_x[i] < std::numeric_limits<float>::max()) {
         pcl::PointXYZ pt = bin_min_pt[i];
-        float theta = std::atan2(pt.x, pt.z);
-        float phi = std::atan2(pt.y, pt.z);
+        float theta = std::atan2(pt.y, pt.x);
+        float phi = std::atan2(pt.z, pt.x);
 
         // Rechazar puntos que pertenezcan a cortes artificiales del FOV o del
-        // filtro Z
+        // filtro X
         bool is_artificial = (theta < theta_min + 0.05f) ||
                              (theta > theta_max - 0.05f) ||
-                             (phi > phi_max - 0.05f) || (pt.z > 1.45f);
+                             (phi > phi_max - 0.05f) || (pt.x > 1.45f);
 
         if (!is_artificial) {
           edge_cloud->points.push_back(pt);
@@ -341,7 +341,7 @@ private:
       ly1 = -ly1;
       lz1 = -lz1;
     }
-    double angle1 = std::atan2(lz1, lx1) * (180.0 / M_PI);
+    double angle1 = std::atan2(lz1, ly1) * (180.0 / M_PI);
 
     // Intentar buscar una SEGUNDA línea (por si hay mesas en forma de L)
     pcl::PointCloud<pcl::PointXYZ>::Ptr edge_cloud_remaining(
@@ -373,7 +373,7 @@ private:
           ly2 = -ly2;
           lz2 = -lz2;
         }
-        double angle2 = std::atan2(lz2, lx2) * (180.0 / M_PI);
+        double angle2 = std::atan2(lz2, ly2) * (180.0 / M_PI);
 
         // Elegir la línea cuyo ángulo se parezca más al último ángulo conocido
         // Esto evita saltos bruscos cuando hay dos bordes formando una esquina
@@ -399,10 +399,10 @@ private:
       lz = -lz;
     }
 
-    // Calcular ángulo de la línea respecto al eje X (visto desde arriba en el
-    // plano X-Z) Cuando la mesa está perfectamente de frente, el borde es
-    // horizontal (Lz = 0, Lx > 0) -> angle = 0
-    double angle_rad = std::atan2(lz, lx);
+    // Calcular ángulo de la línea respecto al eje Y (visto desde arriba en el
+    // plano Y-Z) Cuando la mesa está perfectamente de frente, el borde es
+    // horizontal (Lz = 0, Ly > 0) -> angle = 0
+    double angle_rad = std::atan2(lz, ly);
     double angle_deg = angle_rad * (180.0 / M_PI);
 
     // Normalizar si es necesario (ya debería estar entre -180 y 180 por atan2)
